@@ -1,0 +1,5 @@
+
+[31mYou are running pip as root. Please use 'airflow' user to run pip![0m
+
+[33mSee: https://airflow.apache.org/docs/docker-stack/build.html#adding-new-pypi-packages-individually[0m
+

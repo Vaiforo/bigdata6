@@ -3,6 +3,8 @@ import json
 import asyncio
 from datetime import datetime
 
+import pendulum
+
 import aiohttp
 
 from airflow.decorators import dag, task
@@ -10,13 +12,7 @@ from airflow.sensors.python import PythonSensor
 from airflow.operators.empty import EmptyOperator
 from airflow.operators.python import get_current_context
 
-
-PERSON_ID = 1003026
-DEFAULT_START = "2026.02.02"
-DEFAULT_FINISH = "2026.02.08"
-
-FLAG_PATH = "/opt/airflow/dags/configs/start_process.conf"
-OUT_DIR = "/opt/airflow/dags/data"
+from config import *
 
 
 async def get_json_async(url: str) -> list:
@@ -39,35 +35,64 @@ def get_json_sync(url: str) -> list:
 
 
 @dag(
-    dag_id="omgtu_respect_schedule",
+    dag_id="omgtu_scheduler",
     start_date=datetime(1900, 1, 1),
     schedule=None,
     catchup=False,
     tags=["omgtu", "respect", "schedule"],
 )
 def dag_schedule():
-    wait_for_flag = PythonSensor(
-        task_id="wait_for_start_flag",
-        python_callable=lambda: os.path.exists(FLAG_PATH),
-        poke_interval=10,
-        timeout=60 * 60 * 6,
-        mode="poke",
-    )
+    # wait_for_flag = PythonSensor(
+    #     task_id="wait_for_start_flag",
+    #     python_callable=lambda: os.path.exists(FLAG_PATH),
+    #     poke_interval=10,
+    #     timeout=60 * 60 * 6,
+    #     mode="poke",
+    # )
+    start = EmptyOperator(task_id="start")
 
     @task
-    def fetch_schedule() -> list:
+    def use_person_id() -> int:
+        context = get_current_context()
+
+        dag_run = context.get("dag_run")
+        conf = dag_run.conf if dag_run and dag_run.conf else {}
+
+        person_id = conf.get("person_id", DEFAULT_PERSON_ID)
+
+        print(f"Получили person_id = {person_id}")
+
+        return int(person_id)
+
+    @task
+    def fetch_schedule(person_id: int) -> list:
         ctx = get_current_context()
         conf = (ctx.get("dag_run").conf or {}) if ctx.get("dag_run") else {}
 
-        start = conf.get("start", DEFAULT_START)
-        finish = conf.get("finish", DEFAULT_FINISH)
+        base_ds = conf.get("ds")
+        logical_date: pendulum.DateTime = (
+            pendulum.parse(base_ds) if base_ds else ctx["logical_date"]
+        )
+
+        week_start = logical_date.start_of("week")
+
+        week_end = week_start.add(days=6)
+
+        default_start = week_start.format("YYYY.MM.DD")
+        default_finish = week_end.format("YYYY.MM.DD")
+
+        start = conf.get("start", default_start)
+        finish = conf.get("finish", default_finish)
 
         url = (
-            f"https://rasp.omgtu.ru/api/schedule/person/{PERSON_ID}"
+            f"https://rasp.omgtu.ru/api/schedule/person/{person_id}"
             f"?start={start}&finish={finish}&lng=1"
         )
 
+        print(f"logical_date={logical_date.to_iso8601_string()}")
+        print(f"week_start={default_start} week_end={default_finish}")
         print(f"Запрос расписания: {url}")
+
         return get_json_sync(url)
 
     @task.branch
@@ -75,9 +100,9 @@ def dag_schedule():
         return "save_json" if schedule else "stay_home"
 
     @task
-    def save_json(schedule: list, run_ds_nodash: str) -> str:
+    def save_json(schedule: list, person_id: int, run_ds_nodash: str) -> str:
         os.makedirs(OUT_DIR, exist_ok=True)
-        path = os.path.join(OUT_DIR, f"respect_schedule_{run_ds_nodash}.json")
+        path = os.path.join(OUT_DIR, f"schedule_{person_id}_{run_ds_nodash}.json")
 
         with open(path, "w", encoding="utf-8") as f:
             json.dump(schedule, f, ensure_ascii=False, indent=2)
@@ -86,19 +111,29 @@ def dag_schedule():
         return path
 
     @task
-    def stay_home() -> None:
+    def stay_home(person_id: int) -> None:
+        ctx = get_current_context()
+        conf = (ctx.get("dag_run").conf or {}) if ctx.get("dag_run") else {}
+        ds_nodash = conf.get("ds_nodash") or ctx["ds_nodash"]
+
+        os.makedirs(OUT_DIR, exist_ok=True)
+        path = os.path.join(OUT_DIR, f"schedule_{person_id}_{ds_nodash}.EMPTY")
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("no data")
         print("На этой неделе пар у коллеги нет, можно отдыхать")
 
     done = EmptyOperator(task_id="done")
 
-    schedule = fetch_schedule()
+    person_id = use_person_id()
+    schedule = fetch_schedule(person_id)
     branch = choose_branch(schedule)
 
-    saved = save_json(schedule=schedule, run_ds_nodash="{{ ds_nodash }}")
+    saved = save_json(schedule=schedule, person_id=person_id, run_ds_nodash="{{ ds_nodash }}")
 
-    wait_for_flag >> schedule >> branch
+    start >> person_id >> schedule >> branch
     branch >> saved >> done
-    branch >> stay_home() >> done
+    branch >> stay_home(person_id) >> done
 
 
 dag_schedule()
